@@ -2,7 +2,7 @@ Assets
 Dataset
 node_modules
 *.log
-Tests
+# Tests
 .DS_Store
 *.gob
 manifest.json
