@@ -1,0 +1,10 @@
+Assets
+Dataset
+node_modules
+*.log
+Tests
+.DS_Store
+*.gob
+manifest.json
+go.*
+!go.mod
