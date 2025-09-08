@@ -246,7 +246,7 @@ async function processDoc(doc: any) {
 
 	const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "freyr-"));
 	try {
-		const { code, stdout, stderr } = await runFreyrCapture(freyrUri, tmpDir);
+		let { code, stdout, stderr } = await runFreyrCapture(freyrUri, tmpDir);
 
 		if (code !== 0) {
 			console.error(`freyr failed for ${id} (code=${code}). stderr:\n${stderr}\nstdout:\n${stdout}`);
@@ -260,6 +260,7 @@ async function processDoc(doc: any) {
 		}
 
 		// locate audio
+		if (!process.env.VERBOSE) stderr = "hidden (set VERBOSE=true in env to show)";
 		const playlistPath = path.join(tmpDir, PLAYLIST_NAME);
 		let filePath = await readPlaylistFirstTrack(playlistPath);
 		if (!filePath) filePath = await findFirstAudioFile(tmpDir);
