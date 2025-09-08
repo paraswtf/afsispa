@@ -272,7 +272,7 @@ async function processDoc(doc: any) {
 					data: { duration: -2 }
 				});
 			}
-			console.error(`No output file found for ${id}. freyr stdout:${stdout ? "\n" + stdout : "hidden (set VERBOSE=true in env to show)"}\nfreyr stderr:\n${stderr}`);
+			console.error(`No output file found for ${id}. freyr stdout:${stdout ? "\n" + stdout : "hidden (set VERBOSE=true in env to show)"}\nfreyr stderr:${stdout ? "\n" : ""}${stderr}`);
 			return;
 		}
 
