@@ -265,7 +265,7 @@ async function processDoc(doc: any) {
 		let filePath = await readPlaylistFirstTrack(playlistPath);
 		if (!filePath) filePath = await findFirstAudioFile(tmpDir);
 		if (!filePath) {
-			if (stderr.endsWith("[Zero sources found])")) stderr = "No Sources";
+			if (stderr.includes("[Zero sources found])")) stderr = "No Sources";
 			console.error(`No output file found for ${id}. freyr stdout:${stdout ? "\n" + stdout : "hidden (set VERBOSE=true in env to show)"}\nfreyr stderr:\n${stderr}`);
 			return;
 		}
