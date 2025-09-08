@@ -116,7 +116,7 @@ function buildFreyrUri(doc: any): string | null {
 
 function runFreyrCapture(uri: string, tmpDir: string): Promise<{ code: number | null; stdout: string; stderr: string }> {
 	return new Promise((resolve, reject) => {
-		const args = [uri, "-d", tmpDir, "-p", PLAYLIST_NAME, "-b", String(TARGET_BITRATE), "--no-logo", "--no-header", "-o", "conf.json"];
+		const args = [uri, "-d", tmpDir, "-p", PLAYLIST_NAME, "-b", String(TARGET_BITRATE), "--no-logo", "--no-header", "--config", "conf.json"];
 		const p = spawn(FREYR_CMD, args, { stdio: ["ignore", "pipe", "pipe"] });
 
 		let stdout = "";
