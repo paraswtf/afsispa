@@ -16,6 +16,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	xxhash "github.com/OneOfOne/xxhash"
@@ -35,11 +36,14 @@ const (
 	MaxTargets       = 3
 	MaxTimeDeltaMs   = 3000
 	QuantizeBins     = 1024
+
 	// DB writer batching
-	DBChanBuf        = 1 << 16 // channel buffer for entries (adjust to memory)
-	FlushEveryWrites = 10000   // flush writebatch every N writes
-	FlushEveryMs     = 2000    // or every X milliseconds
+	DBChanBuf        = 1 << 16
+	FlushEveryWrites = 10000
+	FlushEveryMs     = 2000
 	MinFileSizeBytes = 10 * 1024
+
+	StatusIntervalSec = 5
 )
 
 type Peak struct {
@@ -58,46 +62,66 @@ type KV struct {
 	Val []byte
 }
 
+// status counters (atomic)
+var (
+	totalFiles       int64
+	processedFiles   int64
+	inFlightFiles    int64
+	emittedEntries   int64
+	errorFiles       int64
+	dbQueueLength    int64 // approximate: len(dbCh) read periodically
+)
+
 func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
+
+	paths, err := filepath.Glob(filepath.Join(TrackDir, "*.m4a"))
+	if err != nil {
+		log.Fatalf("glob tracks: %v", err)
+	}
+	atomic.StoreInt64(&totalFiles, int64(len(paths)))
+	log.Printf("Found %d tracks\n", len(paths))
+
 	db, err := badger.Open(badger.DefaultOptions(IndexDir).WithLogger(nil))
 	if err != nil {
 		log.Fatalf("badger open: %v", err)
 	}
 	defer db.Close()
 
-	// find files
-	paths, err := filepath.Glob(filepath.Join(TrackDir, "*.m4a"))
-	if err != nil {
-		log.Fatalf("glob tracks: %v", err)
-	}
-	log.Printf("Found %d tracks\n", len(paths))
-
 	// channel for db writes
 	dbCh := make(chan KV, DBChanBuf)
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
 
-	// start single db writer goroutine
+	// start db writer
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		dbWriter(ctx, db, dbCh)
 	}()
 
-	// start worker pool
+	// worker pool
 	workers := runtime.NumCPU()
-	log.Printf("Spawning %d workers\n", workers)
 	fileCh := make(chan string, 512)
 	var wwg sync.WaitGroup
+
+	// status reporter goroutine
+	stopStatus := make(chan struct{})
+	go statusReporter(fileCh, dbCh, stopStatus)
+
+	log.Printf("Spawning %d workers\n", workers)
 	for i := 0; i < workers; i++ {
 		wwg.Add(1)
 		go func() {
 			defer wwg.Done()
 			for p := range fileCh {
+				atomic.AddInt64(&inFlightFiles, 1)
 				if err := processOneAndEmit(p, dbCh); err != nil {
 					log.Printf("err processing %s: %v", p, err)
+					atomic.AddInt64(&errorFiles, 1)
 				}
+				atomic.AddInt64(&processedFiles, 1)
+				atomic.AddInt64(&inFlightFiles, -1)
 			}
 		}()
 	}
@@ -111,10 +135,50 @@ func main() {
 
 	// workers done; close db channel and wait for db writer to finish
 	close(dbCh)
-	// wait for dbWriter to flush and exit
 	wg.Wait()
+	// stop status reporter
+	close(stopStatus)
 	cancel()
+
 	log.Println("Indexing complete.")
+	printFinalStatus()
+}
+
+// statusReporter prints status periodically
+func statusReporter(fileCh chan string, dbCh chan KV, stop <-chan struct{}) {
+	t := time.NewTicker(time.Second * StatusIntervalSec)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			// approximate db queue length
+			dbQLen := int64(len(dbCh))
+			atomic.StoreInt64(&dbQueueLength, dbQLen)
+			printStatus()
+		case <-stop:
+			return
+		}
+	}
+}
+
+func printStatus() {
+	total := atomic.LoadInt64(&totalFiles)
+	done := atomic.LoadInt64(&processedFiles)
+	inflight := atomic.LoadInt64(&inFlightFiles)
+	dbql := atomic.LoadInt64(&dbQueueLength)
+	emitted := atomic.LoadInt64(&emittedEntries)
+	errs := atomic.LoadInt64(&errorFiles)
+
+	percent := float64(0)
+	if total > 0 {
+		percent = (float64(done) / float64(total)) * 100.0
+	}
+	log.Printf("[status] total=%d done=%d (%.1f%%) in-flight=%d db-queue=%d emitted=%d errors=%d",
+		total, done, percent, inflight, dbql, emitted, errs)
+}
+
+func printFinalStatus() {
+	printStatus()
 }
 
 // dbWriter runs in single goroutine, owns one WriteBatch and flushes periodically.
@@ -145,6 +209,7 @@ func dbWriter(ctx context.Context, db *badger.DB, ch <-chan KV) {
 				flush()
 				return
 			}
+			// approximate track of queue length happens outside; increment emittedEntries
 			if err := wb.Set(kv.Key, kv.Val); err != nil {
 				log.Printf("WriteBatch.Set error: %v; attempting flush and retry", err)
 				flush()
@@ -153,9 +218,11 @@ func dbWriter(ctx context.Context, db *badger.DB, ch <-chan KV) {
 					log.Printf("retry failed: %v", err2)
 				} else {
 					writeCount++
+					atomic.AddInt64(&emittedEntries, 1)
 				}
 			} else {
 				writeCount++
+				atomic.AddInt64(&emittedEntries, 1)
 			}
 			if writeCount >= FlushEveryWrites {
 				flush()
@@ -165,7 +232,7 @@ func dbWriter(ctx context.Context, db *badger.DB, ch <-chan KV) {
 			}
 		case <-flushTicker.C:
 			flush()
-			// reset batch if needed
+			// reset batch
 			wb.Cancel()
 			wb = db.NewWriteBatch()
 		case <-ctx.Done():
@@ -180,19 +247,16 @@ func processOneAndEmit(path string, dbCh chan<- KV) error {
 	base := filepath.Base(path)
 	if strings.HasPrefix(base, "._") || strings.HasPrefix(base, ".") {
 		// skip mac resource files / hidden files
-		log.Printf("skipping hidden/resource file: %s", path)
 		return nil
 	}
 	fi, err := os.Stat(path)
 	if err != nil {
-		return fmt.Errorf("stat: %w", err)
+		return err
 	}
 	if fi.Size() < MinFileSizeBytes {
 		// move to quarantine for manual inspection
 		if err := moveToQuarantine(path, base); err != nil {
-			log.Printf("move to quarantine failed: %v", err)
-		} else {
-			log.Printf("moved tiny file %s to quarantine", path)
+			return err
 		}
 		return nil
 	}
@@ -203,7 +267,6 @@ func processOneAndEmit(path string, dbCh chan<- KV) error {
 		if err2 := moveToQuarantine(path, base); err2 != nil {
 			return fmt.Errorf("probe failed and move failed: %v; probeErr: %w", err2, err)
 		}
-		log.Printf("moved corrupt/unreadable file %s to quarantine", path)
 		return nil
 	}
 
