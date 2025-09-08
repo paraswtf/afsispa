@@ -9,7 +9,7 @@
 	"scripts": {
 		"dev": "tsx watch src/index.ts",
 		"dl": "tsx watch src/downloader.ts",
-		"token": "tsx scripts/get-token.ts",
+		"token": "tsx src/get-token.ts",
 		"dev:script": "tsx watch src/jobs/myScript.ts",
 		"build": "rimraf dist && tsc -p tsconfig.build.json",
 		"start": "node dist/index.js",
