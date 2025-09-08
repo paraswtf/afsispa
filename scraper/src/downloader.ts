@@ -227,19 +227,20 @@ async function saveAlbumArtToDir(tmpDir: string, metadata: mm.IAudioMetadata | n
 }
 
 /**
- * Process single document: run freyr, move audio to OUTPUT_DIR, save art to ART_DIR, update DB duration.
+ * Process single document: run freyr, move audio to OUTPUT_DIR, save art to ART_DIR.
+ * Returns an object for a DB update { id, duration } or null if no DB update is needed.
  */
-async function processDoc(doc: any) {
+async function processDoc(doc: any): Promise<{ id: string; duration: number } | null> {
 	const id = doc._id && (doc._id.$oid || doc._id.toString) ? (doc._id.$oid ?? doc._id.toString()) : (doc.id ?? doc._id?.toString?.() ?? null);
 	if (!id) {
 		console.warn("Skipping doc with no id-like field:", JSON.stringify(doc).slice(0, 200));
-		return;
+		return null;
 	}
 
 	const freyrUri = buildFreyrUri(doc);
 	if (!freyrUri) {
 		console.warn(`Skipping ${id}: cannot construct a supported freyr URI. stored uri=${doc.uri ?? "(none)"} spotifyId=${doc.spotifyId ?? "(none)"}`);
-		return;
+		return null;
 	}
 
 	console.log(`→ [${id}] using freyr URI: ${freyrUri}`);
@@ -253,10 +254,10 @@ async function processDoc(doc: any) {
 			const lower = (stderr + "\n" + stdout).toLowerCase();
 			if (lower.includes("invalid query") || lower.includes("invalid uri") || lower.includes("invalid")) {
 				console.warn(`freyr reported invalid query for ${id}; skipping.`);
-				return;
+				return null;
 			}
 			console.warn(`freyr returned non-zero code for ${id}; skipping.`);
-			return;
+			return null;
 		}
 
 		// locate audio
@@ -265,15 +266,13 @@ async function processDoc(doc: any) {
 		let filePath = await readPlaylistFirstTrack(playlistPath);
 		if (!filePath) filePath = await findFirstAudioFile(tmpDir);
 		if (!filePath) {
-			if (stderr.includes("Zero sources found")) {
+			if (stderr.includes("Zero sources found") || stderr.includes("No Sources") || stderr.includes("failed: Failed collecting sources")) {
 				stderr = "No Sources";
-				await prisma.track.update({
-					where: { id },
-					data: { duration: -2 }
-				});
+				// Instead of updating DB here, return an update descriptor
+				return { id, duration: -2 };
 			}
 			console.error(`No output file found for ${id}. freyr stdout:${stdout ? "\n" + stdout : "hidden (set VERBOSE=true in env to show)"}\nfreyr stderr:${stdout ? "\n" : ""}${stderr}`);
-			return;
+			return null;
 		}
 
 		if (!path.isAbsolute(filePath)) filePath = path.resolve(tmpDir, filePath);
@@ -281,7 +280,7 @@ async function processDoc(doc: any) {
 			await fs.access(filePath);
 		} catch {
 			console.error(`Declared file path does not exist for ${id}: ${filePath}`);
-			return;
+			return null;
 		}
 
 		// parse metadata
@@ -327,29 +326,24 @@ async function processDoc(doc: any) {
 			console.log(`No album art found for ${id}.`);
 		}
 
-		// update DB duration if available
+		// Return DB update descriptor if we have duration
 		if (durationSec) {
-			try {
-				await prisma.track.update({
-					where: { id },
-					data: { duration: durationSec }
-				});
-				console.log(`Updated DB for ${id}: duration=${durationSec}s`);
-			} catch (dbErr) {
-				console.error(`Failed to update DB for ${id}: ${(dbErr as Error).message}`);
-			}
+			return { id, duration: durationSec };
 		} else {
-			console.log(`Skipped DB update for ${id} because duration couldn't be read.`);
+			// nothing to update (we could return a special value if you want to mark unknown)
+			return null;
 		}
 	} catch (err) {
 		console.error(`Unhandled error processing ${id}: ${(err as Error).message}`);
+		return null;
 	} finally {
 		await safeRmDir(tmpDir);
 	}
 }
 
 /**
- * Paging + processing loop.
+ * Paging + processing loop - processes each page, then processes docs in sub-chunks
+ * of size CONCURRENCY and performs batched DB updates after each chunk.
  */
 async function pageAndProcess() {
 	const missingFilter = {
@@ -357,7 +351,6 @@ async function pageAndProcess() {
 	};
 
 	let skip = 0;
-	const limit = pLimit(CONCURRENCY);
 
 	while (true) {
 		console.log(`raw find Track: skip=${skip} limit=${BATCH_SIZE} filter=${JSON.stringify(missingFilter)}`);
@@ -377,8 +370,44 @@ async function pageAndProcess() {
 			break;
 		}
 
-		console.log(`Fetched ${docs.length} docs (skip=${skip}). Processing up to ${CONCURRENCY} concurrently.`);
-		await Promise.all(docs.map((d) => limit(() => processDoc(d))));
+		console.log(`Fetched ${docs.length} docs (skip=${skip}). Processing in chunks of ${CONCURRENCY}.`);
+
+		// process docs in chunks of size CONCURRENCY to bound concurrency and allow batched DB updates
+		for (let i = 0; i < docs.length; i += CONCURRENCY) {
+			const chunk = docs.slice(i, i + CONCURRENCY);
+			// map to promises
+			const promises = chunk.map((d) => processDoc(d));
+			// await all results for this chunk
+			const results = await Promise.all(promises);
+
+			// collect DB updates (non-null results)
+			const updates = results.filter(Boolean) as { id: string; duration: number }[];
+
+			if (updates.length > 0) {
+				try {
+					// build transaction array
+					const ops = updates.map((u) =>
+						prisma.track.update({
+							where: { id: u.id },
+							data: { duration: u.duration }
+						})
+					);
+					// execute as a single transaction
+					await prisma.$transaction(ops);
+					console.log(`Batched DB update applied for ${updates.length} tracks (chunk starting at index ${i}).`);
+				} catch (dbErr) {
+					console.error("Batched DB update failed:", (dbErr as Error).message);
+					// fallback: try single updates to get per-item errors (optional)
+					for (const u of updates) {
+						try {
+							await prisma.track.update({ where: { id: u.id }, data: { duration: u.duration } });
+						} catch (singleErr) {
+							console.error(`Failed to update track ${u.id}: ${(singleErr as Error).message}`);
+						}
+					}
+				}
+			}
+		}
 
 		skip += docs.length;
 		if (docs.length < BATCH_SIZE) {
