@@ -27,6 +27,50 @@ const SUPPORTED_PREFIXES = ["spotify:", "apple_music:", "deezer:"];
 /**
  * Helpers
  */
+/**
+ * Move a file, falling back to copy+unlink if across filesystems (EXDEV).
+ * Returns the final destination path on success.
+ */
+async function moveFile(src: string, dest: string): Promise<string> {
+	// ensure parent dir exists for dest
+	await fs.mkdir(path.dirname(dest), { recursive: true });
+
+	try {
+		await fs.rename(src, dest);
+		return dest;
+	} catch (err: any) {
+		// If it's not EXDEV, rethrow
+		if (err && err.code !== "EXDEV") {
+			throw err;
+		}
+
+		// EXDEV: copy then unlink
+		// Use fs.copyFile for efficiency
+		try {
+			await fs.copyFile(src, dest);
+		} catch (copyErr) {
+			// if copy failed, ensure no half-file left
+			try {
+				await fs.unlink(dest);
+			} catch (_) {
+				/* ignore */
+			}
+			throw copyErr;
+		}
+
+		// remove original
+		try {
+			await fs.unlink(src);
+		} catch (unlinkErr) {
+			// if we couldn't remove the original, that's bad but file was copied;
+			// warn and return dest nonetheless.
+			console.warn(`Warning: copied file to ${dest} but failed to remove original ${src}: ${(unlinkErr as Error).message}`);
+		}
+
+		return dest;
+	}
+}
+
 async function ensureDir(dir: string) {
 	await fs.mkdir(dir, { recursive: true });
 }
@@ -263,8 +307,8 @@ async function processDoc(doc: any) {
 		} catch {
 			// dest not exist
 		}
-		await fs.rename(filePath, dest);
-		console.log(`Saved audio for ${id} -> ${dest}`);
+		const finalDest = await moveFile(filePath, dest);
+		console.log(`Saved audio for ${id} -> ${finalDest}`);
 
 		// save album art to ART_DIR
 		await ensureDir(ART_DIR);
