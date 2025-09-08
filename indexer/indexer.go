@@ -3,6 +3,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"time"
 
 	xxhash "github.com/OneOfOne/xxhash"
 	"github.com/dgraph-io/badger/v3"
@@ -22,21 +24,40 @@ import (
 )
 
 const (
-	TrackDir        = "/srv/tracks"
-	IndexDir        = "/srv/indexdb"
-	SampleRate      = 44100
-	Channels        = 1
-	WindowSize      = 4096    // FFT window size
-	HopSize         = 2048    // hop between windows
-	PeakNeighborhood = 3      // freq bins neighborhood to consider for local maxima
-	MaxPeaksPerFrame = 10     // limit peaks per frame
-	MaxTargets       = 3      // for each anchor pick up to 3 targets to make 4D hash
-	MaxTimeDeltaMs   = 3000   // look forward up to 3s for pairing
-	QuantizeBins     = 1024   // quantize frequencies into this many bins (for hashing)
-	BatchSize        = 1000   // batch DB writes
+	TrackDir         = "/srv/tracks"
+	IndexDir         = "/srv/indexdb"
+	SampleRate       = 44100
+	Channels         = 1
+	WindowSize       = 4096
+	HopSize          = 2048
+	PeakNeighborhood = 3
+	MaxPeaksPerFrame = 10
+	MaxTargets       = 3
+	MaxTimeDeltaMs   = 3000
+	QuantizeBins     = 1024
+	// DB writer batching
+	DBChanBuf        = 1 << 16 // channel buffer for entries (adjust to memory)
+	FlushEveryWrites = 10000   // flush writebatch every N writes
+	FlushEveryMs     = 2000    // or every X milliseconds
+	MinFileSizeBytes = 10 * 1024
 )
 
-// index entry format in value: trackID|anchorMs\n (text line). Cheap and portable.
+type Peak struct {
+	TimeFrame int
+	FreqBin   int
+	Mag       float64
+}
+
+type Finger struct {
+	hash     uint64
+	anchorMs int64
+}
+
+type KV struct {
+	Key []byte
+	Val []byte
+}
+
 func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 	db, err := badger.Open(badger.DefaultOptions(IndexDir).WithLogger(nil))
@@ -45,38 +66,148 @@ func main() {
 	}
 	defer db.Close()
 
+	// find files
 	paths, err := filepath.Glob(filepath.Join(TrackDir, "*.m4a"))
 	if err != nil {
-		log.Fatalf("glob: %v", err)
+		log.Fatalf("glob tracks: %v", err)
 	}
 	log.Printf("Found %d tracks\n", len(paths))
 
-	fileCh := make(chan string, 256)
+	// channel for db writes
+	dbCh := make(chan KV, DBChanBuf)
+	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
+
+	// start single db writer goroutine
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		dbWriter(ctx, db, dbCh)
+	}()
+
+	// start worker pool
 	workers := runtime.NumCPU()
 	log.Printf("Spawning %d workers\n", workers)
+	fileCh := make(chan string, 512)
+	var wwg sync.WaitGroup
 	for i := 0; i < workers; i++ {
-		wg.Add(1)
+		wwg.Add(1)
 		go func() {
-			defer wg.Done()
+			defer wwg.Done()
 			for p := range fileCh {
-				if err := processOne(db, p); err != nil {
+				if err := processOneAndEmit(p, dbCh); err != nil {
 					log.Printf("err processing %s: %v", p, err)
 				}
 			}
 		}()
 	}
 
+	// enqueue files
 	for _, p := range paths {
 		fileCh <- p
 	}
 	close(fileCh)
+	wwg.Wait()
+
+	// workers done; close db channel and wait for db writer to finish
+	close(dbCh)
+	// wait for dbWriter to flush and exit
 	wg.Wait()
+	cancel()
 	log.Println("Indexing complete.")
 }
 
-func processOne(db *badger.DB, path string) error {
-	trackID := strings.TrimSuffix(filepath.Base(path), ".m4a")
+// dbWriter runs in single goroutine, owns one WriteBatch and flushes periodically.
+func dbWriter(ctx context.Context, db *badger.DB, ch <-chan KV) {
+	wb := db.NewWriteBatch()
+	defer wb.Cancel()
+	writeCount := 0
+	flushTicker := time.NewTicker(time.Millisecond * time.Duration(FlushEveryMs))
+	defer flushTicker.Stop()
+
+	flush := func() {
+		if writeCount == 0 {
+			return
+		}
+		if err := wb.Flush(); err != nil {
+			log.Printf("wb.Flush error: %v", err)
+			// try to recover: cancel and create a new batch
+			wb.Cancel()
+			wb = db.NewWriteBatch()
+		}
+		writeCount = 0
+	}
+
+	for {
+		select {
+		case kv, ok := <-ch:
+			if !ok {
+				flush()
+				return
+			}
+			if err := wb.Set(kv.Key, kv.Val); err != nil {
+				log.Printf("WriteBatch.Set error: %v; attempting flush and retry", err)
+				flush()
+				// create a fresh set attempt
+				if err2 := wb.Set(kv.Key, kv.Val); err2 != nil {
+					log.Printf("retry failed: %v", err2)
+				} else {
+					writeCount++
+				}
+			} else {
+				writeCount++
+			}
+			if writeCount >= FlushEveryWrites {
+				flush()
+				// create new writebatch after flush
+				wb.Cancel()
+				wb = db.NewWriteBatch()
+			}
+		case <-flushTicker.C:
+			flush()
+			// reset batch if needed
+			wb.Cancel()
+			wb = db.NewWriteBatch()
+		case <-ctx.Done():
+			flush()
+			return
+		}
+	}
+}
+
+// processOneAndEmit fingerprints a single file and emits KV pairs to dbCh
+func processOneAndEmit(path string, dbCh chan<- KV) error {
+	base := filepath.Base(path)
+	if strings.HasPrefix(base, "._") || strings.HasPrefix(base, ".") {
+		// skip mac resource files / hidden files
+		log.Printf("skipping hidden/resource file: %s", path)
+		return nil
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("stat: %w", err)
+	}
+	if fi.Size() < MinFileSizeBytes {
+		// move to quarantine for manual inspection
+		if err := moveToQuarantine(path, base); err != nil {
+			log.Printf("move to quarantine failed: %v", err)
+		} else {
+			log.Printf("moved tiny file %s to quarantine", path)
+		}
+		return nil
+	}
+
+	// quick ffmpeg probe to ensure file is readable
+	if err := ffprobe(path); err != nil {
+		// move to quarantine
+		if err2 := moveToQuarantine(path, base); err2 != nil {
+			return fmt.Errorf("probe failed and move failed: %v; probeErr: %w", err2, err)
+		}
+		log.Printf("moved corrupt/unreadable file %s to quarantine", path)
+		return nil
+	}
+
+	// decode to pcm
 	samples, err := decodeToPCM(path)
 	if err != nil {
 		return fmt.Errorf("decode: %w", err)
@@ -86,31 +217,37 @@ func processOne(db *badger.DB, path string) error {
 	if len(peaks) == 0 {
 		return errors.New("no peaks")
 	}
-
 	hashes := build4DHashes(peaks)
 	if len(hashes) == 0 {
 		return errors.New("no hashes")
 	}
 
-	// batch write to badger
-	wb := db.NewWriteBatch()
-	defer wb.Cancel()
-	count := 0
+	trackID := strings.TrimSuffix(base, ".m4a")
+	// emit kv pairs
 	for _, h := range hashes {
 		key := make([]byte, 8)
 		binary.BigEndian.PutUint64(key, h.hash)
 		val := fmt.Sprintf("%s|%d\n", trackID, h.anchorMs)
-		if err := wb.Set(key, []byte(val)); err != nil {
-			return err
-		}
-		count++
-		if count%BatchSize == 0 {
-			if err := wb.Flush(); err != nil {
-				return err
-			}
-		}
+		dbCh <- KV{Key: key, Val: []byte(val)}
 	}
-	if err := wb.Flush(); err != nil {
+	return nil
+}
+
+func moveToQuarantine(path, base string) error {
+	qdir := "/srv/track-quarantine"
+	if err := os.MkdirAll(qdir, 0755); err != nil {
+		return err
+	}
+	dst := filepath.Join(qdir, base)
+	return os.Rename(path, dst)
+}
+
+func ffprobe(path string) error {
+	// run ffmpeg quick probe (null output) to check readability
+	cmd := exec.Command("ffmpeg", "-v", "error", "-i", path, "-f", "null", "-")
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	if err := cmd.Run(); err != nil {
 		return err
 	}
 	return nil
@@ -127,7 +264,6 @@ func decodeToPCM(path string) ([]float64, error) {
 		return nil, err
 	}
 	data := out.Bytes()
-	// 16-bit signed little-endian -> float64 in [-1,1]
 	samples := make([]float64, 0, len(data)/2)
 	reader := bytes.NewReader(data)
 	for {
@@ -141,13 +277,6 @@ func decodeToPCM(path string) ([]float64, error) {
 		samples = append(samples, float64(v)/32768.0)
 	}
 	return samples, nil
-}
-
-type Peak struct {
-	TimeFrame int   // frame index
-	FreqBin   int   // frequency bin index
-	Mag       float64
-	// time in ms = TimeFrame * HopSize / SampleRate * 1000
 }
 
 func spectrogram(samples []float64, window, hop int) [][]float64 {
@@ -164,15 +293,10 @@ func spectrogram(samples []float64, window, hop int) [][]float64 {
 		for i := 0; i < window; i++ {
 			frame[i] = samples[start+i] * win[i]
 		}
-		// convert to complex for FFT
-		complexFrame := make([]complex128, window)
-		for i := 0; i < window; i++ {
-			complexFrame[i] = complex(frame[i], 0)
-		}
 		fftRes := fft.FFTReal(frame)
 		mags := make([]float64, window/2)
 		for i := 0; i < window/2; i++ {
-			mags[i] = cmplxAbs(fftRes[i]) // magnitude
+			mags[i] = cmplxAbs(fftRes[i])
 		}
 		spec[f] = mags
 	}
@@ -195,7 +319,7 @@ func detectPeaks(spec [][]float64) []Peak {
 		cands := make([]candidate, 0, 16)
 		for b := 0; b < numBins; b++ {
 			mag := spec[t][b]
-			// local neighborhood
+			// local neighborhood check
 			isPeak := true
 			for nb := b-PeakNeighborhood; nb <= b+PeakNeighborhood; nb++ {
 				if nb < 0 || nb >= numBins || nb == b {
@@ -206,15 +330,13 @@ func detectPeaks(spec [][]float64) []Peak {
 					break
 				}
 			}
-			if isPeak && mag > 1e-6 { // threshold
+			if isPeak && mag > 1e-6 {
 				cands = append(cands, candidate{bin: b, mag: mag})
 			}
 		}
-		// keep top K peaks by magnitude in this frame
 		if len(cands) > 0 {
-			// simple partial sort
 			if len(cands) > MaxPeaksPerFrame {
-				// sort descending and trim
+				// partial selection: top K
 				for i := 0; i < MaxPeaksPerFrame; i++ {
 					maxI := i
 					for j := i + 1; j < len(cands); j++ {
@@ -234,28 +356,17 @@ func detectPeaks(spec [][]float64) []Peak {
 	return peaks
 }
 
-// Represent a 4D hash: anchor freq, three target freqs, and time deltas quantized.
-type Finger struct {
-	hash     uint64
-	anchorMs int64
-}
-
 func build4DHashes(peaks []Peak) []Finger {
-	// Build time -> peaks mapping for quick lookups
-	frameMap := map[int][]Peak{}
-	for _, p := range peaks {
-		frameMap[p.TimeFrame] = append(frameMap[p.TimeFrame], p)
+	if len(peaks) == 0 {
+		return nil
 	}
-	// sort peak frames ascending is not required but helps
-	var out []Finger
-	// convert frame index -> ms
 	frameToMs := func(frame int) int64 {
 		return int64(frame*HopSize*1000/SampleRate)
 	}
-	// anchor: iterate peaks; for each anchor, find up to MaxTargets peaks in next MaxTimeDeltaMs
+	out := []Finger{}
+	// iterate anchors; choose next MaxTargets peaks within time window
 	for i, anchor := range peaks {
 		anchorMs := frameToMs(anchor.TimeFrame)
-		// collect candidate target peaks within time window
 		targets := []Peak{}
 		maxFrameDelta := (MaxTimeDeltaMs * SampleRate) / (HopSize * 1000)
 		for j := i + 1; j < len(peaks) && (peaks[j].TimeFrame-anchor.TimeFrame) <= maxFrameDelta; j++ {
@@ -264,16 +375,11 @@ func build4DHashes(peaks []Peak) []Finger {
 			}
 			targets = append(targets, peaks[j])
 		}
-		// we need at least 3 targets to form a 4D hash
 		if len(targets) < MaxTargets {
 			continue
 		}
-		// choose up to MaxTargets deterministically: e.g., nearest in time or highest mag
-		// we'll pick the first MaxTargets
 		selected := targets[:MaxTargets]
-		// quantize freq bins into buckets
 		qf := func(bin int) uint16 {
-			// bin ranges 0..WindowSize/2
 			bins := WindowSize / 2
 			val := int(math.Floor(float64(bin) * float64(QuantizeBins) / float64(bins)))
 			if val < 0 {
@@ -288,7 +394,6 @@ func build4DHashes(peaks []Peak) []Finger {
 		tq1 := qf(selected[0].FreqBin)
 		tq2 := qf(selected[1].FreqBin)
 		tq3 := qf(selected[2].FreqBin)
-		// quantize time deltas (ms) into small ints (0..65535)
 		dq := func(dt int64) uint16 {
 			if dt < 0 {
 				dt = 0
@@ -301,17 +406,22 @@ func build4DHashes(peaks []Peak) []Finger {
 		d1 := dq(frameToMs(selected[0].TimeFrame) - anchorMs)
 		d2 := dq(frameToMs(selected[1].TimeFrame) - anchorMs)
 		d3 := dq(frameToMs(selected[2].TimeFrame) - anchorMs)
-		// produce bytes for hashing: aq,tq1,tq2,tq3,d1,d2,d3
-		buf := make([]byte, 2*7)
+		buf := make([]byte, 14)
 		offset := 0
-		binary.BigEndian.PutUint16(buf[offset:], aq); offset += 2
-		binary.BigEndian.PutUint16(buf[offset:], tq1); offset += 2
-		binary.BigEndian.PutUint16(buf[offset:], tq2); offset += 2
-		binary.BigEndian.PutUint16(buf[offset:], tq3); offset += 2
-		binary.BigEndian.PutUint16(buf[offset:], d1); offset += 2
-		binary.BigEndian.PutUint16(buf[offset:], d2); offset += 2
-		binary.BigEndian.PutUint16(buf[offset:], d3); offset += 2
-		// fast 64-bit hash
+		binary.BigEndian.PutUint16(buf[offset:], aq)
+		offset += 2
+		binary.BigEndian.PutUint16(buf[offset:], tq1)
+		offset += 2
+		binary.BigEndian.PutUint16(buf[offset:], tq2)
+		offset += 2
+		binary.BigEndian.PutUint16(buf[offset:], tq3)
+		offset += 2
+		binary.BigEndian.PutUint16(buf[offset:], d1)
+		offset += 2
+		binary.BigEndian.PutUint16(buf[offset:], d2)
+		offset += 2
+		binary.BigEndian.PutUint16(buf[offset:], d3)
+		offset += 2
 		h := xxhash.Checksum64(buf)
 		out = append(out, Finger{hash: h, anchorMs: anchorMs})
 	}
