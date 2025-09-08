@@ -1,5 +1,4 @@
 // src/lib/http.ts
-import fetch, { RequestInit, Response } from "node-fetch";
 import { getUrlCache, setUrlCache } from "../db/helpers";
 
 type SpotifyAuthEntry = {
