@@ -260,12 +260,12 @@ async function processDoc(doc: any) {
 		}
 
 		// locate audio
-		if (!process.env.VERBOSE) stdout = "hidden (set VERBOSE=true in env to show)";
+		if (!process.env.VERBOSE) stdout = "";
 		const playlistPath = path.join(tmpDir, PLAYLIST_NAME);
 		let filePath = await readPlaylistFirstTrack(playlistPath);
 		if (!filePath) filePath = await findFirstAudioFile(tmpDir);
 		if (!filePath) {
-			console.error(`No output file found for ${id}. freyr stdout:\n${stdout}\nfreyr stderr:\n${stderr}`);
+			console.error(`No output file found for ${id}. freyr stdout:${stdout ? "\n" + stdout : "hidden (set VERBOSE=true in env to show)"}\nfreyr stderr:\n${stderr}`);
 			return;
 		}
 
