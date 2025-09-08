@@ -24,6 +24,10 @@ import (
 
 	"github.com/vbauerster/mpb/v8"
 	"github.com/vbauerster/mpb/v8/decor"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 	"gonum.org/v1/gonum/dsp/fourier"
 )
 
@@ -111,20 +115,29 @@ type Manifest struct {
 	HopSize    int           `json:"hop"`
 }
 
+// ---------------- Mongo Globals ----------------
+
+var mongoClient *mongo.Client
+var tracksColl *mongo.Collection
+var fpColl *mongo.Collection
+
 // ---------------- Main ----------------
 
 func main() {
 	log.SetFlags(0)
 
-	mode := flag.String("mode", "", "add | query | compact | (legacy: index)")
-	dataset := flag.String("dataset", "", "folder with new songs to index (Artist/Album/*.m4a)")
+	mode := flag.String("mode", "", "add | query | compact | index | add-mongo | query-mongo")
+	dataset := flag.String("dataset", "", "folder with new songs to index")
 	segmentOut := flag.String("segment", "", "segment output file (when mode=add); default seg-<timestamp>.gob")
 	manifestPath := flag.String("manifest", "manifest.json", "segment manifest path (for add/query/compact)")
 	indexFile := flag.String("index", "index.gob", "legacy single-index file (query fallback)")
 	queryFile := flag.String("file", "", "query recording (.m4a)")
 	topK := flag.Int("top", 10, "number of top matches to show")
 	workers := flag.Int("workers", defaultWorkers, "concurrent workers for indexing (0=auto)")
+	mongoURI := flag.String("mongo", "mongodb://127.0.0.1:27017/?directConnection=true&serverSelectionTimeoutMS=2000", "MongoDB URI")
+	mongoDBName := flag.String("db", "tuney", "MongoDB database name")
 	compactOut := flag.String("compact-into", "", "output segment path when mode=compact; default seg-merged-<timestamp>.gob")
+	force := flag.Bool("force", false, "re-index tracks even if already in MongoDB")
 	flag.Parse()
 
 	switch *mode {
@@ -233,6 +246,31 @@ func main() {
 			log.Fatalf("save error: %v", err)
 		}
 		fmt.Printf("✅ Indexed %d tracks → %s\n", len(db.Tracks), *indexFile)
+
+		case "add-mongo":
+			if *dataset == "" {
+				log.Fatal("missing -dataset")
+			}
+			if err := initMongo(*mongoURI, *mongoDBName); err != nil {
+				log.Fatalf("mongo connect error: %v", err)
+			}
+			if err := buildIndexMongo(*dataset, *workers, *force); err != nil {
+				log.Fatalf("mongo add error: %v", err)
+			}
+			fmt.Println("✅ Added to MongoDB")
+
+	case "query-mongo":
+		if *queryFile == "" {
+			log.Fatal("missing -file")
+		}
+		if err := initMongo(*mongoURI, *mongoDBName); err != nil {
+			log.Fatalf("mongo connect error: %v", err)
+		}
+		results, err := queryFileMongo(*queryFile, *topK)
+		if err != nil {
+			log.Fatalf("mongo query error: %v", err)
+		}
+		printTop(results)
 
 	default:
 		fmt.Println("Usage:")
@@ -410,6 +448,16 @@ func buildIndex(root string, workerArg int) (*FingerprintDB, error) {
 	return db, nil
 }
 
+func trackExists(relPath string) (bool, interface{}) {
+    ctx := context.Background()
+    var doc bson.M
+    err := tracksColl.FindOne(ctx, bson.M{"rel_path": relPath}).Decode(&doc)
+    if err == mongo.ErrNoDocuments {
+        return false, nil
+    }
+    return err == nil, doc["_id"]
+}
+
 func collectTracks(root string) ([]string, error) {
 	var out []string
 	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
@@ -455,6 +503,281 @@ func splitClean(path string) []string {
 		}
 	}
 	return parts
+}
+
+// ---------------- Mongo Helpers ----------------
+
+func initMongo(uri, dbName string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	client, err := mongo.Connect(ctx, options.Client().ApplyURI(uri))
+	if err != nil {
+		return err
+	}
+	mongoClient = client
+	db := client.Database(dbName)
+	tracksColl = db.Collection("tracks")
+	fpColl = db.Collection("fingerprints")
+
+	// Indexes
+	fpColl.Indexes().CreateOne(ctx, mongo.IndexModel{Keys: bson.D{{Key: "hash", Value: 1}}})
+	return nil
+}
+
+func storeTrackAndFingerprints(meta TrackMeta, hashes []Hash) error {
+    ctx := context.Background()
+
+    trackDoc := bson.M{
+        "artist":   meta.Artist,
+        "album":    meta.Album,
+        "title":    meta.Title,
+        "path":     meta.Path,
+        "rel_path": meta.RelPath,
+        "duration": meta.Duration,
+        "created":  time.Now(),
+    }
+    res, err := tracksColl.InsertOne(ctx, trackDoc)
+    if err != nil {
+        return err
+    }
+    trackID := res.InsertedID
+
+    docs := make([]interface{}, len(hashes))
+    for i, h := range hashes {
+        docs[i] = bson.M{
+            "hash":     h.Hash,
+            "track_id": trackID,
+            "anchor_t": h.T1,
+        }
+    }
+    if len(docs) > 0 {
+        _, err = fpColl.InsertMany(ctx, docs)
+        return err
+    }
+    return nil
+}
+
+
+
+func queryFingerprints(hashes []Hash, topK int) ([]MatchCandidate, error) {
+	ctx := context.Background()
+
+	if len(hashes) == 0 {
+		return nil, nil
+	}
+
+	// Collect all query hashes for one big Mongo query
+	hashVals := make([]uint64, len(hashes))
+	for i, h := range hashes {
+		hashVals[i] = h.Hash
+	}
+
+	// One batch query
+	cursor, err := fpColl.Find(ctx, bson.M{"hash": bson.M{"$in": hashVals}})
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close(ctx)
+
+	// Tally votes: trackID → offset → votes
+	vote := make(map[string]map[int]int)
+	totalVotes := make(map[string]int)
+
+	for cursor.Next(ctx) {
+		var doc struct {
+			Hash    uint64             `bson:"hash"`
+			TrackID primitive.ObjectID `bson:"track_id"`
+			AnchorT int                `bson:"anchor_t"`
+		}
+		if err := cursor.Decode(&doc); err != nil {
+			continue
+		}
+
+		// Find matching query hashes for this DB hash
+		for _, h := range hashes {
+			if h.Hash == doc.Hash {
+				offset := doc.AnchorT - h.T1
+				tid := doc.TrackID.Hex()
+				if vote[tid] == nil {
+					vote[tid] = map[int]int{}
+				}
+				vote[tid][offset]++
+				totalVotes[tid]++
+			}
+		}
+	}
+
+	// Convert tallies into results
+	var results []MatchCandidate
+	bestVotesGlobal := 0
+
+	for tid, offsets := range vote {
+		// best offset for this track
+		bestOff, bestVotes := 0, 0
+		for off, v := range offsets {
+			if v > bestVotes {
+				bestVotes, bestOff = v, off
+			}
+		}
+		if bestVotes > bestVotesGlobal {
+			bestVotesGlobal = bestVotes
+		}
+
+		// fetch metadata
+		var trackDoc bson.M
+		oid, _ := primitive.ObjectIDFromHex(tid)
+		err := tracksColl.FindOne(ctx, bson.M{"_id": oid}).Decode(&trackDoc)
+		if err != nil {
+			continue
+		}
+
+		meta := TrackMeta{
+			Artist:   getString(trackDoc, "artist"),
+			Album:    getString(trackDoc, "album"),
+			Title:    getString(trackDoc, "title"),
+			Path:     getString(trackDoc, "path"),
+			RelPath:  getString(trackDoc, "rel_path"),
+			Duration: getFloat(trackDoc, "duration"),
+		}
+
+		results = append(results, MatchCandidate{
+			Meta:          meta,
+			Votes:         bestVotes,
+			TotalVotes:    totalVotes[tid],
+			OffsetFrames:  bestOff,
+			OffsetSeconds: float64(bestOff*hopSize) / float64(targetSampleRate),
+		})
+	}
+
+	// Apply confidence relative to best match
+	if bestVotesGlobal == 0 {
+		bestVotesGlobal = 1
+	}
+	for i := range results {
+		results[i].Confidence = float64(results[i].Votes) / float64(bestVotesGlobal)
+	}
+
+	// Sort results (votes → totalVotes → offset closeness → title)
+	sort.Slice(results, func(i, j int) bool {
+		if results[i].Votes != results[j].Votes {
+			return results[i].Votes > results[j].Votes
+		}
+		if results[i].TotalVotes != results[j].TotalVotes {
+			return results[i].TotalVotes > results[j].TotalVotes
+		}
+		if abs(results[i].OffsetFrames) != abs(results[j].OffsetFrames) {
+			return abs(results[i].OffsetFrames) < abs(results[j].OffsetFrames)
+		}
+		return results[i].Meta.Title < results[j].Meta.Title
+	})
+
+	if len(results) > topK {
+		results = results[:topK]
+	}
+	return results, nil
+}
+
+
+// ---------------- Mongo Index/Query Wrappers ----------------
+
+func buildIndexMongo(root string, workerArg int, force bool) error {
+    tracks, err := collectTracks(root)
+    if err != nil {
+        return err
+    }
+    if len(tracks) == 0 {
+        return fmt.Errorf("no .m4a files")
+    }
+
+    p := mpb.New()
+    bar := p.AddBar(int64(len(tracks)),
+        mpb.PrependDecorators(
+            decor.Name("Indexing: "),
+            decor.CountersNoUnit("%d / %d"),
+        ),
+        mpb.AppendDecorators(
+            decor.Percentage(),
+            decor.EwmaETA(decor.ET_STYLE_GO, 60),
+        ),
+    )
+
+    w := workerArg
+    if w <= 0 {
+        w = runtime.NumCPU() - 1
+        if w < 2 {
+            w = 2
+        }
+    }
+
+    jobs := make(chan string, len(tracks))
+    var wg sync.WaitGroup
+    for i := 0; i < w; i++ {
+        wg.Add(1)
+        go func() {
+            defer wg.Done()
+            win := hann(frameSize)
+            fft := fourier.NewFFT(frameSize)
+
+            for path := range jobs {
+                rel := relPath(root, path)
+
+                // Check if already indexed
+                exists, existingID := trackExists(rel)
+                if exists && !force {
+                    fmt.Printf("⏩ Skipping %s (already indexed)\n", rel)
+                    bar.Increment()
+                    continue
+                }
+                if exists && force {
+                    // Remove old track + fingerprints before re-indexing
+                    _, _ = tracksColl.DeleteOne(context.Background(), bson.M{"_id": existingID})
+                    _, _ = fpColl.DeleteMany(context.Background(), bson.M{"track_id": existingID})
+                    fmt.Printf("🔄 Re-indexing %s\n", rel)
+                }
+
+                // Decode + fingerprint only if needed
+                samples, sr, dur, err := decodeToMonoFloat32(path, targetSampleRate)
+                if err != nil || sr != targetSampleRate {
+                    bar.Increment()
+                    continue
+                }
+                spec := stftWithPlan(samples, frameSize, hopSize, win, fft)
+                peaks := findSpectralPeaksTopK(spec, minPeakDB, peakNeighborhoodTf, peakNeighborhoodF, topKPerFrame)
+                hashes := makeLandmarkHashesFast(peaks, targetZoneMinDT, targetZoneMaxDT, maxPairsPerAnchor)
+
+                meta := parseMetaFromPath(root, path)
+                meta.Path = path
+                meta.RelPath = rel
+                meta.Duration = dur
+
+                _ = storeTrackAndFingerprints(meta, hashes)
+                bar.Increment()
+            }
+        }()
+    }
+
+    for _, t := range tracks {
+        jobs <- t
+    }
+    close(jobs)
+    wg.Wait()
+    p.Wait()
+    return nil
+}
+
+
+func queryFileMongo(file string, k int) ([]MatchCandidate, error) {
+	samples, sr, _, err := decodeToMonoFloat32(file, targetSampleRate)
+	if err != nil {
+		return nil, err
+	}
+	if sr != targetSampleRate {
+		return nil, fmt.Errorf("bad sample rate")
+	}
+	spec := stft(samples, frameSize, hopSize)
+	peaks := findSpectralPeaks(spec, minPeakDB, peakNeighborhoodTf, peakNeighborhoodF)
+	hashes := makeLandmarkHashes(peaks, targetZoneMinDT, targetZoneMaxDT, maxPairsPerAnchor)
+	return queryFingerprints(hashes, k)
 }
 
 // ---------------- Matching ----------------
@@ -648,13 +971,16 @@ func printTop(results []MatchCandidate) {
 		fmt.Println("❌ No matches found.")
 		return
 	}
-	fmt.Printf("Top %d candidates:\n", len(results))
 	for i, r := range results {
-		fmt.Printf("%2d) %s / %s / %s  | votes=%d  total=%d  offset=%.2fs  confidence=%.2f\n",
-			i+1, r.Meta.Artist, r.Meta.Album, r.Meta.Title,
-			r.Votes, r.TotalVotes, r.OffsetSeconds, r.Confidence)
+		fmt.Printf(
+			"%2d) %s / %s / %s\n    votes=%d, totalVotes=%d, offsetFrames=%d, offset=%.2fs, confidence=%.2f\n",
+			i+1,
+			r.Meta.Artist, r.Meta.Album, r.Meta.Title,
+			r.Votes, r.TotalVotes, r.OffsetFrames, r.OffsetSeconds, r.Confidence,
+		)
 	}
 }
+
 
 // ---------------- Compaction (merge segments, no rehash) ----------------
 
@@ -1054,4 +1380,27 @@ func abs(x int) int {
 		return -x
 	}
 	return x
+}
+
+func getString(m bson.M, key string) string {
+	if v, ok := m[key]; ok {
+		if s, ok2 := v.(string); ok2 {
+			return s
+		}
+	}
+	return ""
+}
+
+func getFloat(m bson.M, key string) float64 {
+	if v, ok := m[key]; ok {
+		switch x := v.(type) {
+		case float64:
+			return x
+		case int32:
+			return float64(x)
+		case int64:
+			return float64(x)
+		}
+	}
+	return 0
 }

@@ -1,0 +1,80 @@
+generator client {
+    provider = "prisma-client-js"
+}
+
+datasource db {
+    provider = "mongodb"
+    url      = env("DATABASE_URL")
+}
+
+model Artist {
+    id                String                 @id @default(cuid()) @map("_id")
+    spotifyId         String                 @unique
+    name              String
+    type              String
+    uri               String                 @unique
+    createdAt         DateTime               @default(now())
+    updatedAt         DateTime               @updatedAt
+    albumRelation     AlbumArtistRelations[]
+    hasCrawlCompleted Boolean                @default(false)
+}
+
+model Album {
+    id                     String                 @id @default(cuid()) @map("_id")
+    spotifyId              String                 @unique
+    album_type             String
+    total_tracks           Int
+    available_markets      String[]
+    images                 Image[]
+    name                   String
+    release_date           String
+    release_date_precision String
+    type                   String
+    uri                    String                 @unique
+    albumRelation          AlbumArtistRelations[]
+    album_group            String?
+    tracks                 Track[]
+    createdAt              DateTime               @default(now())
+    updatedAt              DateTime               @updatedAt
+}
+
+model Image {
+    id        String   @id @default(cuid()) @map("_id")
+    url       String
+    height    Int?
+    width     Int?
+    album     Album?   @relation(fields: [albumId], references: [id])
+    albumId   String?
+    createdAt DateTime @default(now())
+    updatedAt DateTime @updatedAt
+}
+
+model AlbumArtistRelations {
+    id        String   @id @default(cuid()) @map("_id")
+    album     Album?   @relation(fields: [albumId], references: [id])
+    albumId   String?
+    artist    Artist?  @relation(fields: [artistId], references: [id])
+    artistId  String?
+    createdAt DateTime @default(now())
+    updatedAt DateTime @updatedAt
+}
+
+model Track {
+    id        String   @id @default(cuid()) @map("_id")
+    spotifyId String   @unique
+    uri       String   @unique
+    name      String
+    duration  Int      @default(-1)
+    albumId   String?
+    album     Album?   @relation(fields: [albumId], references: [id])
+    createdAt DateTime @default(now())
+    updatedAt DateTime @updatedAt
+}
+
+model UrlCache {
+    id        String    @id @default(cuid()) @map("_id")
+    url       String    @unique
+    data      Json
+    createdAt DateTime? @default(now())
+    updatedAt DateTime? @default(now()) @updatedAt
+}

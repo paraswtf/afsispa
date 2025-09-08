@@ -8,3 +8,9 @@ node_modules
 manifest.json
 go.*
 !go.mod
+*Dataset*
+cache.json
+/Tracks
+/Art
+*.cache
+.env
