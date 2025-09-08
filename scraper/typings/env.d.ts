@@ -7,5 +7,8 @@ declare namespace NodeJS {
 		SPOTIFY_CLIENT_ID: string;
 		SPOTIFY_CLIENT_SECRET: string;
 		DATABASE_URL: string;
+		TRACKS_OUT_DIR: string;
+		ART_OUT_DIR: string;
+		FREYR_CMD: string;
 	}
 }

@@ -14,9 +14,11 @@ const prisma = new PrismaClient();
  */
 const BATCH_SIZE = 40;
 const CONCURRENCY = 2;
-const FREYR_CMD = "freyr"; // or docker wrapper
-const OUTPUT_DIR = path.resolve("../Tracks");
-const ART_DIR = path.resolve("../Art"); // separate art directory
+if (!process.env.FREYR_CMD) throw new Error("Missing required environment variables");
+if (!process.env.TRACKS_OUT_DIR || !process.env.ART_OUT_DIR) throw new Error("Missing required environment variables");
+const FREYR_CMD = process.env.FREYR_CMD;
+const OUTPUT_DIR = path.resolve(process.env.TRACKS_OUT_DIR);
+const ART_DIR = path.resolve(process.env.ART_OUT_DIR);
 const PLAYLIST_NAME = "freyr_playlist.m3u";
 const TARGET_BITRATE = 320; // kbps - passed to freyr and used as human threshold
 
