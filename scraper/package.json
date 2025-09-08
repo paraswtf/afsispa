@@ -8,7 +8,7 @@
 	},
 	"scripts": {
 		"dev": "tsx watch src/index.ts",
-		"dl": "tsx watch src/downloader-neo.ts",
+		"dl": "tsx watch src/downloader.ts",
 		"dev:script": "tsx watch src/jobs/myScript.ts",
 		"build": "rimraf dist && tsc -p tsconfig.build.json",
 		"start": "node dist/index.js",
