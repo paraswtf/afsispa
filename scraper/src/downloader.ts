@@ -13,7 +13,7 @@ const prisma = new PrismaClient();
  * CONFIG
  */
 const BATCH_SIZE = 40;
-const CONCURRENCY = 2;
+const CONCURRENCY = process.env.DL_CONCURRENCY ? parseInt(process.env.DL_CONCURRENCY) : 2;
 if (!process.env.FREYR_CMD) throw new Error("Missing required environment variables");
 if (!process.env.TRACKS_OUT_DIR || !process.env.ART_OUT_DIR) throw new Error("Missing required environment variables");
 const FREYR_CMD = process.env.FREYR_CMD;

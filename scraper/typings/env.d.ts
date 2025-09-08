@@ -10,5 +10,6 @@ declare namespace NodeJS {
 		TRACKS_OUT_DIR: string;
 		ART_OUT_DIR: string;
 		FREYR_CMD: string;
+		DL_CONCURRENCY: string;
 	}
 }
