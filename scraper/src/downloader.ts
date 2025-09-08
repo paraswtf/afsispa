@@ -260,7 +260,7 @@ async function processDoc(doc: any) {
 		}
 
 		// locate audio
-		if (!process.env.VERBOSE) stderr = "hidden (set VERBOSE=true in env to show)";
+		if (!process.env.VERBOSE) stdout = "hidden (set VERBOSE=true in env to show)";
 		const playlistPath = path.join(tmpDir, PLAYLIST_NAME);
 		let filePath = await readPlaylistFirstTrack(playlistPath);
 		if (!filePath) filePath = await findFirstAudioFile(tmpDir);
