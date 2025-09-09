@@ -1,14 +1,17 @@
-// matcher.go
+// matcher.go (patched)
+// Usage: ./matcher /path/to/query.m4a
 package main
 
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"log"
 	"math"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,27 +19,34 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	xxhash "github.com/OneOfOne/xxhash"
 	"github.com/dgraph-io/badger/v3"
 	"github.com/dhowden/tag"
 	"github.com/mjibson/go-dsp/fft"
+
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 const (
-	IndexDirLocal = "/srv/indexdb"
-	SampleRate    = 44100
-	WindowSize    = 4096
-	HopSize       = 2048
-	PeakNeighborhood = 3
-	MaxPeaksPerFrame = 10
-	MaxTargets = 3
-	QuantizeBins = 1024
-	MaxTimeDeltaMs = 3000
-	MaxCandidates = 10
+	IndexDirLocal     = "/srv/indexdb"
+	SampleRate        = 44100
+	WindowSize        = 4096
+	HopSize           = 2048
+	PeakNeighborhood  = 3
+	MaxPeaksPerFrame  = 10
+	MaxTargets        = 3
+	QuantizeBins      = 1024
+	MaxTimeDeltaMs    = 3000
+	MaxCandidates     = 10
+	MinAlignedVotes   = 3    // you can tweak this
+	MinConfidence     = 0.01 // alignedVotes / totalQueryHashes threshold
+	TrackFilesDir     = "/srv/tracks" // where your track files live
 )
 
-// simplified peak struct same as indexer
 type Peak struct {
 	TimeFrame int
 	FreqBin   int
@@ -54,12 +64,23 @@ func main() {
 		os.Exit(2)
 	}
 	query := os.Args[1]
+
+	// open badger
 	db, err := badger.Open(badger.DefaultOptions(IndexDirLocal).WithLogger(nil))
 	if err != nil {
 		log.Fatalf("open db: %v", err)
 	}
 	defer db.Close()
 
+	// try to init mongo client if MONGO_URI provided
+	mongoClient, mongoDB := initMongoIfConfigured()
+	if mongoClient != nil {
+		defer func() {
+			_ = mongoClient.Disconnect(context.Background())
+		}()
+	}
+
+	// decode query
 	samples, err := decodeToPCM(query)
 	if err != nil {
 		log.Fatalf("decode: %v", err)
@@ -67,15 +88,18 @@ func main() {
 	spec := spectrogram(samples, WindowSize, HopSize)
 	peaks := detectPeaks(spec)
 	hashes := build4DHashes(peaks)
+	if len(hashes) == 0 {
+		log.Fatalf("no hashes generated from query")
+	}
+	totalQueryHashes := len(hashes)
 
-	// tally map: trackID -> (offsetMs -> count)
+	// tally: trackID -> map[offset]count
 	type OffMap map[int64]int
 	tally := map[string]OffMap{}
 	var mu sync.Mutex
-
-	// for each query hash, look up in DB
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, 8)
+
 	for _, h := range hashes {
 		wg.Add(1)
 		sem <- struct{}{}
@@ -93,7 +117,6 @@ func main() {
 					return err
 				}
 				return item.Value(func(val []byte) error {
-					// val may contain many lines "trackID|anchorMs\n" appended; parse them
 					sc := bufio.NewScanner(bytes.NewReader(val))
 					for sc.Scan() {
 						line := sc.Text()
@@ -121,12 +144,13 @@ func main() {
 	}
 	wg.Wait()
 
-	// convert to candidate list: compute best offset votes per track and total matches
+	// score candidates
 	type Candidate struct {
 		TrackID    string
 		BestOffset int64
 		Votes      int
 		TotalHits  int
+		Confidence float64 // Votes / totalQueryHashes
 	}
 	cands := []Candidate{}
 	for tid, om := range tally {
@@ -140,9 +164,26 @@ func main() {
 				bestOffset = off
 			}
 		}
-		cands = append(cands, Candidate{TrackID: tid, BestOffset: bestOffset, Votes: bestVotes, TotalHits: total})
+		conf := 0.0
+		if totalQueryHashes > 0 {
+			conf = float64(bestVotes) / float64(totalQueryHashes)
+		}
+		// apply light thresholds to avoid spamming output; you can tune
+		if bestVotes >= MinAlignedVotes && conf >= MinConfidence {
+			cands = append(cands, Candidate{
+				TrackID:    tid,
+				BestOffset: bestOffset,
+				Votes:      bestVotes,
+				TotalHits:  total,
+				Confidence: conf,
+			})
+		}
 	}
-	// rank by Votes (the aligned votes), then total hits
+	if len(cands) == 0 {
+		log.Println("No candidates passed thresholds. Try lowering thresholds or using a longer/cleaner query clip.")
+		return
+	}
+
 	sort.Slice(cands, func(i, j int) bool {
 		if cands[i].Votes == cands[j].Votes {
 			return cands[i].TotalHits > cands[j].TotalHits
@@ -154,14 +195,156 @@ func main() {
 	if len(cands) < top {
 		top = len(cands)
 	}
-	// print one line per top candidate: "trackID | votes aligned | totalHits | offsetMs | title - artist"
 	for i := 0; i < top; i++ {
 		c := cands[i]
-		title, artist := readEmbeddedMetadata(c.TrackID)
-		fmt.Printf("%s | alignedVotes=%d | totalHits=%d | offsetMs=%d | %s - %s\n",
-			c.TrackID, c.Votes, c.TotalHits, c.BestOffset, title, artist)
+		title, artist := readMetadataOrMongo(c.TrackID, mongoDB)
+		fmt.Printf("%s | alignedVotes=%d | totalHits=%d | offsetMs=%d | confidence=%.3f | %s - %s\n",
+			c.TrackID, c.Votes, c.TotalHits, c.BestOffset, c.Confidence, title, artist)
 	}
 }
+
+// readMetadataOrMongo: try embedded tags first; if missing, try mongo DB (if available)
+func readMetadataOrMongo(trackID string, db *mongo.Database) (string, string) {
+	title, artist := readEmbeddedMetadata(trackID)
+	if title != "unknown" || artist != "unknown" {
+		return title, artist
+	}
+	if db == nil {
+		return "unknown", "unknown"
+	}
+	// try to find track document in a few likely collection names
+	collNames := []string{"Track", "track", "tracks", "Tracks"}
+	for _, cn := range collNames {
+		coll := db.Collection(cn)
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		var doc bson.M
+		err := coll.FindOne(ctx, bson.M{"_id": trackID}).Decode(&doc)
+		cancel()
+		if err != nil {
+			continue
+		}
+		// try fields
+		if v, ok := doc["name"]; ok && v != nil {
+			title = fmt.Sprint(v)
+		} else if v, ok := doc["title"]; ok && v != nil {
+			title = fmt.Sprint(v)
+		}
+		// simple attempt for artist: doc may have "artist" or via album relations
+		if v, ok := doc["artist"]; ok && v != nil {
+			artist = fmt.Sprint(v)
+			return title, artist
+		}
+		// if albumId present, try to fetch album->artist via relations
+		if aidI, ok := doc["albumId"]; ok && aidI != nil {
+			aid := fmt.Sprint(aidI)
+			// find album
+			albumCollNames := []string{"Album", "album", "albums", "Albums"}
+			var albumDoc bson.M
+			for _, acn := range albumCollNames {
+				ctx2, cancel2 := context.WithTimeout(context.Background(), 3*time.Second)
+				err2 := db.Collection(acn).FindOne(ctx2, bson.M{"_id": aid}).Decode(&albumDoc)
+				cancel2()
+				if err2 == nil {
+					break
+				}
+			}
+			// if albumDoc found, search AlbumArtistRelations for artistId
+			if albumDoc != nil {
+				aarColls := []string{"AlbumArtistRelations", "albumartistrelations", "album_artist_relations", "albumArtistRelations", "AlbumArtistRelations"}
+				for _, aar := range aarColls {
+					ctx3, cancel3 := context.WithTimeout(context.Background(), 3*time.Second)
+					var rel bson.M
+					err3 := db.Collection(aar).FindOne(ctx3, bson.M{"albumId": aid}).Decode(&rel)
+					cancel3()
+					if err3 == nil {
+						if atidI, ok := rel["artistId"]; ok && atidI != nil {
+							artistId := fmt.Sprint(atidI)
+							// query artist
+							artistColls := []string{"Artist", "artist", "artists", "Artists"}
+							for _, ac := range artistColls {
+								ctx4, cancel4 := context.WithTimeout(context.Background(), 3*time.Second)
+								var art bson.M
+								err4 := db.Collection(ac).FindOne(ctx4, bson.M{"_id": artistId}).Decode(&art)
+								cancel4()
+								if err4 == nil {
+									if v, ok := art["name"]; ok && v != nil {
+										artist = fmt.Sprint(v)
+										return title, artist
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+		// return whatever we found from track doc (even if artist empty)
+		return title, artist
+	}
+	return "unknown", "unknown"
+}
+
+// readEmbeddedMetadata tries to read metadata tags from the file /srv/tracks/<trackID>.m4a
+func readEmbeddedMetadata(trackID string) (string, string) {
+	path := filepath.Join(TrackFilesDir, trackID+".m4a")
+	f, err := os.Open(path)
+	if err != nil {
+		return "unknown", "unknown"
+	}
+	defer f.Close()
+	m, err := tag.ReadFrom(f)
+	if err != nil {
+		return "unknown", "unknown"
+	}
+	t := m.Title()
+	a := m.Artist()
+	if strings.TrimSpace(t) == "" {
+		t = "unknown"
+	}
+	if strings.TrimSpace(a) == "" {
+		a = "unknown"
+	}
+	return t, a
+}
+
+// initMongoIfConfigured inspects MONGO_URI and attempts to connect.
+// It returns (client, db) if successful, otherwise (nil, nil).
+func initMongoIfConfigured() (*mongo.Client, *mongo.Database) {
+	uri := os.Getenv("MONGO_URI")
+	if strings.TrimSpace(uri) == "" {
+		return nil, nil
+	}
+	// determine DB name: prefer MONGO_DB, otherwise parse URI path
+	dbName := os.Getenv("MONGO_DB")
+	if dbName == "" {
+		u, err := url.Parse(uri)
+		if err == nil {
+			dbName = strings.Trim(u.Path, "/")
+		}
+	}
+	if dbName == "" {
+		log.Printf("MONGO_URI provided but DB name not found. Set MONGO_DB env var if automatic parse fails.")
+		// continue: use empty name -> fallback not good; return nil
+		return nil, nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	clientOpts := options.Client().ApplyURI(uri)
+	client, err := mongo.Connect(ctx, clientOpts)
+	if err != nil {
+		log.Printf("mongo connect error: %v", err)
+		return nil, nil
+	}
+	if err := client.Ping(ctx, nil); err != nil {
+		log.Printf("mongo ping error: %v", err)
+		_ = client.Disconnect(ctx)
+		return nil, nil
+	}
+	return client, client.Database(dbName)
+}
+
+// --- Below: same audio fingerprinting helpers as before (spectrogram, peaks, hashing, decode) ---
 
 func decodeToPCM(path string) ([]float64, error) {
 	cmd := exec.Command("ffmpeg", "-hide_banner", "-loglevel", "error", "-i", path,
@@ -177,13 +360,13 @@ func decodeToPCM(path string) ([]float64, error) {
 	reader := bytes.NewReader(data)
 	for {
 		var v int16
-			if err := binary.Read(reader, binary.LittleEndian, &v); err != nil {
-				if err == io.EOF {
-					break
-				}
-				return nil, err
+		if err := binary.Read(reader, binary.LittleEndian, &v); err != nil {
+			if err.Error() == "EOF" || err == io.EOF {
+				break
 			}
-			samples = append(samples, float64(v)/32768.0)
+			return nil, err
+		}
+		samples = append(samples, float64(v)/32768.0)
 	}
 	return samples, nil
 }
@@ -263,6 +446,9 @@ func detectPeaks(spec [][]float64) []Peak {
 }
 
 func build4DHashes(peaks []Peak) []Finger {
+	if len(peaks) == 0 {
+		return nil
+	}
 	frameToMs := func(frame int) int64 {
 		return int64(frame*HopSize*1000/SampleRate)
 	}
@@ -308,7 +494,6 @@ func build4DHashes(peaks []Peak) []Finger {
 		d1 := dq(frameToMs(selected[0].TimeFrame) - anchorMs)
 		d2 := dq(frameToMs(selected[1].TimeFrame) - anchorMs)
 		d3 := dq(frameToMs(selected[2].TimeFrame) - anchorMs)
-
 		buf := make([]byte, 14)
 		offset := 0
 		binary.BigEndian.PutUint16(buf[offset:], aq); offset += 2
@@ -318,23 +503,8 @@ func build4DHashes(peaks []Peak) []Finger {
 		binary.BigEndian.PutUint16(buf[offset:], d1); offset += 2
 		binary.BigEndian.PutUint16(buf[offset:], d2); offset += 2
 		binary.BigEndian.PutUint16(buf[offset:], d3); offset += 2
-
 		h := xxhash.Checksum64(buf)
 		out = append(out, Finger{hash: h, anchorMs: anchorMs})
 	}
 	return out
-}
-
-func readEmbeddedMetadata(trackID string) (string, string) {
-	path := filepath.Join("./srv/tracks", trackID+".m4a")
-	f, err := os.Open(path)
-	if err != nil {
-		return "unknown", "unknown"
-	}
-	defer f.Close()
-	m, err := tag.ReadFrom(f)
-	if err != nil {
-		return "unknown", "unknown"
-	}
-	return m.Title(), m.Artist()
 }
