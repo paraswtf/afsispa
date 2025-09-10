@@ -14,3 +14,8 @@ cache.json
 /Art
 *.cache
 .env
+10clip
+30clip
+60clip
+songs
+*.gob.gz
